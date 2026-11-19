@@ -15,6 +15,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 class KmsCustomKeyStoreServiceTest {
     private static final String ACCOUNT = "000000000000";
@@ -71,6 +72,21 @@ class KmsCustomKeyStoreServiceTest {
                 null, "/new-prefix/kms/xks/v1", null, null, REGION);
         assertEquals("/new-prefix/kms/xks/v1", pathUpdated.getProxyUriPath());
         assertEquals(KmsCustomKeyStore.STATE_CONNECTED, pathUpdated.getConnectionState());
+    }
+
+    @Test
+    void deleteIsRejectedWhileTheCustomKeyStoreHasAssociatedKmsKeys() {
+        KmsCustomKeyStore store = registry.create(candidate(), SECRET_KEY, REGION);
+        KmsService kms = mock(KmsService.class);
+        when(kms.hasKeysInCustomKeyStore(store.getCustomKeyStoreId(), REGION)).thenReturn(true);
+        KmsCustomKeyStoreService guarded = new KmsCustomKeyStoreService(registry, proxy, null, kms);
+
+        AwsException failure = assertThrows(AwsException.class,
+                () -> guarded.delete(store.getCustomKeyStoreId(), REGION));
+
+        assertEquals("CustomKeyStoreInvalidStateException", failure.getErrorCode());
+        assertEquals(KmsCustomKeyStore.STATE_DISCONNECTED,
+                registry.require(store.getCustomKeyStoreId(), REGION).getConnectionState());
     }
 
     @Test

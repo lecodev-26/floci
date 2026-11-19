@@ -17,17 +17,24 @@ public class KmsCustomKeyStoreService {
     private final KmsCustomKeyStoreRegistry registry;
     private final XksProxyClient proxyClient;
     private final RequestContext requestContext;
+    private final KmsService kmsService;
     private final SignedMarkers markers = new SignedMarkers();
 
     @Inject
-    public KmsCustomKeyStoreService(KmsCustomKeyStoreRegistry registry, XksProxyClient proxyClient, RequestContext requestContext) {
+    public KmsCustomKeyStoreService(KmsCustomKeyStoreRegistry registry, XksProxyClient proxyClient,
+                                    RequestContext requestContext, KmsService kmsService) {
         this.registry = registry;
         this.proxyClient = proxyClient;
         this.requestContext = requestContext;
+        this.kmsService = kmsService;
+    }
+
+    KmsCustomKeyStoreService(KmsCustomKeyStoreRegistry registry, XksProxyClient proxyClient, RequestContext requestContext) {
+        this(registry, proxyClient, requestContext, null);
     }
 
     KmsCustomKeyStoreService(KmsCustomKeyStoreRegistry registry, XksProxyClient proxyClient) {
-        this(registry, proxyClient, null);
+        this(registry, proxyClient, null, null);
     }
 
     private String requestId() {
@@ -118,6 +125,10 @@ public class KmsCustomKeyStoreService {
     }
 
     public void delete(String id, String region) {
+        if (kmsService != null && kmsService.hasKeysInCustomKeyStore(id, region)) {
+            throw new AwsException("CustomKeyStoreInvalidStateException",
+                    "The custom key store cannot be deleted while it contains KMS keys", 400);
+        }
         registry.delete(id, region);
     }
 

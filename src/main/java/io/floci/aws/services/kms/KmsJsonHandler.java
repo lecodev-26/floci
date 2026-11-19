@@ -287,7 +287,10 @@ public class KmsJsonHandler {
         rejectUnknownReservedTags(tags,"TagException");
         String origin = request.path("Origin").asText(null);
         boolean multiRegion = request.path("MultiRegion").asBoolean(false);
-        KmsKey key = service.createKey(description, keyUsage, keySpec, policy, tags, origin, multiRegion, region);
+        String customKeyStoreId = optionalText(request, "CustomKeyStoreId");
+        String xksKeyId = optionalText(request, "XksKeyId");
+        KmsKey key = service.createKey(description, keyUsage, keySpec, policy, tags, origin, multiRegion,
+                customKeyStoreId, xksKeyId, region);
         ObjectNode response = objectMapper.createObjectNode();
         response.set("KeyMetadata", addKeyMetadata(key));
         return Response.ok(response).build();
@@ -602,9 +605,13 @@ public class KmsJsonHandler {
 
         String sourceKeyId = request.path("SourceKeyId").asText(null);
         KmsService.DecryptResult source = service.decryptAndResolveKey(
-                ciphertext, sourceContext, region, sourceKeyId, sourceAlgorithm);
-        KmsService.EncryptResult destination = service.encrypt(
-                destKeyId, source.plaintext(), destContext, destAlgorithm, region);
+                ciphertext, sourceContext, region, sourceKeyId, sourceAlgorithm, "ReEncrypt");
+        KmsService.EncryptResult destination;
+        try {
+            destination = service.encrypt(destKeyId, source.plaintext(), destContext, destAlgorithm, region, "ReEncrypt");
+        } finally {
+            java.util.Arrays.fill(source.plaintext(), (byte) 0);
+        }
 
         ObjectNode response = objectMapper.createObjectNode();
         response.put("CiphertextBlob", Base64.getEncoder().encodeToString(destination.ciphertext()));
@@ -1047,6 +1054,10 @@ public class KmsJsonHandler {
         keyMetadata.put("KeyUsage", k.getKeyUsage().name());
         keyMetadata.put("KeyState", k.getKeyState());
         keyMetadata.put("Origin", k.getOrigin());
+        if (k.getCustomKeyStoreId() != null) keyMetadata.put("CustomKeyStoreId", k.getCustomKeyStoreId());
+        if (k.getXksKeyId() != null) {
+            keyMetadata.putObject("XksKeyConfiguration").put("Id", k.getXksKeyId());
+        }
         if (k.getExpirationModel() != null) {
             keyMetadata.put("ExpirationModel", k.getExpirationModel());
         }

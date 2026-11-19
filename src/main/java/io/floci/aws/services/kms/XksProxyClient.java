@@ -3,6 +3,7 @@ package io.floci.aws.services.kms;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.floci.aws.config.ContainerCaBundle;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.AwsException;
@@ -238,6 +239,161 @@ public class XksProxyClient implements AutoCloseable {
             throw new XksProxyException("XksProxyInvalidResponseException",
                     "Could not process the XKS proxy health response", 400, e);
         }
+    }
+
+    /** Sends one authenticated XKS v1 data-plane request. Request and response bodies are never logged. */
+    public JsonNode post(URI endpoint, String uriPath, String accessKeyId, String secretAccessKey,
+                         String region, String requestPath, ObjectNode payload) {
+        URI health = healthUri(endpoint, uriPath, allowTestEndpoint);
+        if (requestPath == null || !requestPath.matches("/keys/[A-Za-z0-9._-]{1,128}/(metadata|encrypt|decrypt)")) {
+            throw new XksProxyException("XksProxyInvalidConfigurationException",
+                    "XKS proxy key operation path is invalid", 400);
+        }
+        String externalKeyId = requestPath.split("/")[2];
+        if (".".equals(externalKeyId) || "..".equals(externalKeyId)) {
+            throw new XksProxyException("XksProxyInvalidConfigurationException",
+                    "XKS external key ID is invalid", 400);
+        }
+        URI target;
+        try {
+            target = URI.create(health.toString().substring(0, health.toString().length() - "/health".length())
+                    + requestPath);
+            if (target.toString().length() > 256) throw new IllegalArgumentException();
+        } catch (IllegalArgumentException e) {
+            throw new XksProxyException("XksProxyInvalidConfigurationException", "XKS proxy URI is invalid", 400, e);
+        }
+        if (accessKeyId == null || !ACCESS_KEY_ID.matcher(accessKeyId).matches()
+                || secretAccessKey == null || !SECRET_ACCESS_KEY.matcher(secretAccessKey).matches()
+                || region == null || !REGION.matcher(region).matches() || payload == null) {
+            throw new XksProxyException("XksProxyInvalidConfigurationException",
+                    "XKS proxy credentials, Region, or request payload are invalid", 400);
+        }
+        byte[] body = null;
+        try {
+            body = objectMapper.writeValueAsBytes(payload);
+            String timestamp = AMZ_DATE.format(Instant.now());
+            String date = timestamp.substring(0, 8);
+            String host = target.getRawAuthority().toLowerCase(java.util.Locale.ROOT);
+            String signedHeaders = "host;x-amz-date";
+            Map<String, String> headers = new TreeMap<>();
+            headers.put("host", host);
+            headers.put("x-amz-date", timestamp);
+            String canonicalHeaders = SigV4Canonicalization.canonicalHeaders(signedHeaders, headers::get);
+            String canonicalRequest = "POST\n" + target.getRawPath() + "\n\n" + canonicalHeaders + "\n"
+                    + signedHeaders + "\n" + Digests.sha256Hex(body);
+            String scope = date + "/" + region + "/" + SERVICE + "/aws4_request";
+            String stringToSign = "AWS4-HMAC-SHA256\n" + timestamp + "\n" + scope + "\n"
+                    + Digests.sha256Hex(canonicalRequest.getBytes(StandardCharsets.UTF_8));
+            byte[] signingKey = SigV4RequestValidator.deriveSigningKey(secretAccessKey, date, region, SERVICE);
+            String signature;
+            byte[] signatureBytes = null;
+            try {
+                signatureBytes = SigV4RequestValidator.hmacSha256(signingKey, stringToSign);
+                signature = SigV4RequestValidator.hexEncode(signatureBytes);
+            } finally {
+                Arrays.fill(signingKey, (byte) 0);
+                if (signatureBytes != null) Arrays.fill(signatureBytes, (byte) 0);
+            }
+            String authorization = "AWS4-HMAC-SHA256 Credential=" + accessKeyId + "/" + scope
+                    + ", SignedHeaders=" + signedHeaders + ", Signature=" + signature;
+            HttpPost request = new HttpPost(target);
+            request.setHeader("Host", host);
+            request.setHeader("Content-Type", "application/json");
+            request.setHeader("X-Amz-Date", timestamp);
+            request.setHeader("Authorization", authorization);
+            request.setEntity(new ByteArrayEntity(body, ContentType.APPLICATION_JSON));
+            return httpClient.execute(request, response -> {
+                byte[] responseBody;
+                if (response.getEntity() == null) responseBody = new byte[0];
+                else try (var stream = response.getEntity().getContent()) {
+                    responseBody = stream.readNBytes(MAX_RESPONSE_BYTES + 1);
+                }
+                if (responseBody.length > MAX_RESPONSE_BYTES) {
+                    throw new XksProxyException("XksProxyInvalidResponseException",
+                            "XKS proxy response exceeds the permitted size", 400);
+                }
+                int status = response.getCode();
+                if (status == 408 || status == 504) {
+                    throw new XksProxyException("XksProxyUriUnreachableException",
+                            "The XKS proxy did not respond within 250 milliseconds", 400,
+                            null, "XKS_PROXY_TIMED_OUT");
+                }
+                JsonNode json = null;
+                if (responseBody.length > 0) {
+                    try {
+                        json = objectMapper.reader().with(DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
+                                .readTree(responseBody);
+                    } catch (IOException e) {
+                        if (status >= 200 && status < 300) {
+                            throw new XksProxyException("XksProxyInvalidResponseException",
+                                    "XKS proxy returned malformed response JSON", 400, e);
+                        }
+                    }
+                }
+                if (status == 200) {
+                    if (json == null || !json.isObject()) {
+                        throw new XksProxyException("XksProxyInvalidResponseException",
+                                "XKS proxy returned an invalid response", 400);
+                    }
+                    return json;
+                }
+                String error = json == null ? null : json.path("errorName").asText(null);
+                throw mapProxyError(status, error, requestPath);
+            });
+        } catch (XksProxyException e) {
+            throw e;
+        } catch (IOException e) {
+            boolean timeout = isTimeout(e);
+            boolean tlsFailure = isTlsFailure(e);
+            String code = timeout ? "XKS_PROXY_TIMED_OUT"
+                    : tlsFailure ? "XKS_PROXY_INVALID_TLS_CONFIGURATION" : "XKS_PROXY_NOT_REACHABLE";
+            throw new XksProxyException("XksProxyUriUnreachableException",
+                    timeout ? "The XKS proxy did not respond within 250 milliseconds"
+                            : tlsFailure ? "The XKS proxy TLS connection could not be established"
+                            : "Could not reach the configured XKS proxy endpoint", 400, e, code);
+        } catch (Exception e) {
+            throw new XksProxyException("XksProxyInvalidResponseException",
+                    "Could not process the XKS proxy response", 400, e);
+        } finally {
+            if (body != null) Arrays.fill(body, (byte) 0);
+        }
+    }
+
+    private static XksProxyException mapProxyError(int status, String error, String requestPath) {
+        boolean keyMetadata = requestPath.endsWith("/metadata");
+        if (status == 401 || "AuthenticationFailedException".equals(error)) {
+            return new XksProxyException(keyMetadata ? "CustomKeyStoreInvalidStateException"
+                    : "KMSInvalidStateException",
+                    "The XKS proxy rejected the configured authentication credentials", 400);
+        }
+        if ("KeyNotFoundException".equals(error)) {
+            return new XksProxyException(keyMetadata ? "XksKeyNotFoundException" : "KMSInvalidStateException",
+                    "The external key was not found", 400);
+        }
+        if ("InvalidUriPathException".equals(error)) {
+            return new XksProxyException("XksProxyInvalidConfigurationException", "The XKS proxy URI path is invalid", 400);
+        }
+        if ("InvalidStateException".equals(error) || "InvalidKeyUsageException".equals(error)) {
+            return new XksProxyException(keyMetadata ? "XksKeyInvalidConfigurationException" : "KMSInvalidStateException",
+                    "The external key is not enabled or does not support the requested operation", 400);
+        }
+        if (status == 403 || "InvalidCiphertextException".equals(error) || "AccessDeniedException".equals(error)) {
+            return new XksProxyException("KMSInvalidStateException",
+                    "The external key or ciphertext is not valid for this operation", 400);
+        }
+        if (status == 408 || status == 429 || status == 503 || status == 504
+                || "ThrottlingException".equals(error) || "DependencyTimeoutException".equals(error)) {
+            return new XksProxyException("XksProxyUriUnreachableException",
+                    "The XKS proxy could not complete the request in the permitted time", 400,
+                    null, status == 408 || status == 503 || status == 504 || "DependencyTimeoutException".equals(error)
+                            ? "XKS_PROXY_TIMED_OUT" : "XKS_PROXY_NOT_REACHABLE");
+        }
+        if (status == 501 || "UnsupportedOperationException".equals(error)) {
+            return new XksProxyException(keyMetadata ? "XksKeyInvalidResponseException" : "KMSInvalidStateException",
+                    "The XKS proxy does not support the requested operation", 400);
+        }
+        return new XksProxyException("XksProxyInvalidResponseException",
+                "The XKS proxy rejected the request or returned an invalid response", 400);
     }
 
     static URI healthUri(URI endpoint, String uriPath) {

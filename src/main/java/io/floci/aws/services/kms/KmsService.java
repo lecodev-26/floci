@@ -52,6 +52,7 @@ public class KmsService implements ResourceProvider {
     private static final String AWS_KMS_ORIGIN = "AWS_KMS";
     private static final String AWS_KEY_MANAGER = "AWS";
     private static final String EXTERNAL_ORIGIN = "EXTERNAL";
+    private static final String EXTERNAL_KEY_STORE_ORIGIN = "EXTERNAL_KEY_STORE";
     private static final String PENDING_IMPORT = "PendingImport";
     private static final String PENDING_DELETION = "PendingDeletion";
     private static final String MULTI_REGION_PRIMARY = "PRIMARY";
@@ -68,33 +69,43 @@ public class KmsService implements ResourceProvider {
     private final RegionResolver regionResolver;
     private final SecureRandom secureRandom;
     private final KmsKeyTypes keyTypes;
+    private final XksDataPlaneService xksDataPlaneService;
     // Guards the check-generate-put sequence in ensureBackingKeyMaterial so two concurrent
     // first uses of the same legacy key cannot each mint a different backing key.
     // Hold from resolving a stored key through publishing its changes. Rotation publishes a
     // copy, so a writer holding an older live storage value must never put that value back.
     // Replica registration uses the same lock so rotation cannot miss a new replica.
     private final StripedLocks backingKeyMaterialLocks = new StripedLocks(256);
+    // Serializes association of one external key ID so concurrent CreateKey calls cannot
+    // attach the same XKS key to two KMS keys.
+    private final StripedLocks xksKeyAssociationLocks = new StripedLocks(256);
     // Guards the scan-and-mint sequence in ensureAwsManagedKeys so two concurrent first reads of
     // a region's alias namespace cannot each mint a key for the same alias/aws/* name.
     private final Object awsManagedKeyLock = new Object();
     private final Object aliasCreateLock = new Object();
 
     @Inject
-    public KmsService(StorageFactory storageFactory, RegionResolver regionResolver) {
+    public KmsService(StorageFactory storageFactory, RegionResolver regionResolver, XksDataPlaneService xksDataPlaneService) {
         this(storageFactory.create("kms", "kms-keys.json",
                         new TypeReference<>() {}),
                 storageFactory.create("kms", "kms-aliases.json",
                         new TypeReference<>() {}),
                 storageFactory.create("kms", "kms-grants.json",
                         new TypeReference<>() {}),
-                regionResolver);
+                regionResolver, new SecureRandom(), xksDataPlaneService);
+    }
+
+    public KmsService(StorageFactory storageFactory, RegionResolver regionResolver) {
+        this(storageFactory.create("kms", "kms-keys.json", new TypeReference<>() {}),
+                storageFactory.create("kms", "kms-aliases.json", new TypeReference<>() {}),
+                storageFactory.create("kms", "kms-grants.json", new TypeReference<>() {}), regionResolver);
     }
 
     KmsService(StorageBackend<String, KmsKey> keyStore,
                StorageBackend<String, KmsAlias> aliasStore,
                StorageBackend<String, KmsGrant> grantStore,
                RegionResolver regionResolver) {
-        this(keyStore, aliasStore, grantStore, regionResolver, new SecureRandom());
+        this(keyStore, aliasStore, grantStore, regionResolver, new SecureRandom(), null);
     }
 
     KmsService(StorageBackend<String, KmsKey> keyStore,
@@ -102,12 +113,20 @@ public class KmsService implements ResourceProvider {
                StorageBackend<String, KmsGrant> grantStore,
                RegionResolver regionResolver,
                SecureRandom secureRandom) {
+        this(keyStore, aliasStore, grantStore, regionResolver, secureRandom, null);
+    }
+
+    KmsService(StorageBackend<String, KmsKey> keyStore,
+               StorageBackend<String, KmsAlias> aliasStore,
+               StorageBackend<String, KmsGrant> grantStore,
+               RegionResolver regionResolver, SecureRandom secureRandom, XksDataPlaneService xksDataPlaneService) {
         this.keyStore = keyStore;
         this.aliasStore = aliasStore;
         this.grantStore = grantStore;
         this.regionResolver = regionResolver;
         this.secureRandom = secureRandom;
         this.keyTypes = new KmsKeyTypes(secureRandom);
+        this.xksDataPlaneService = xksDataPlaneService;
     }
 
     public byte[] generateRandom(int numberOfBytes) {
@@ -150,6 +169,25 @@ public class KmsService implements ResourceProvider {
 
     public KmsKey createKey(String description, String keyUsage, String keySpec, String policy,
                             Map<String, String> tags, String origin, boolean multiRegion, String region) {
+        return createKey(description, keyUsage, keySpec, policy, tags, origin, multiRegion, null, null, region);
+    }
+
+    public KmsKey createKey(String description, String keyUsage, String keySpec, String policy,
+                            Map<String, String> tags, String origin, boolean multiRegion,
+                            String customKeyStoreId, String xksKeyId, String region) {
+        if (EXTERNAL_KEY_STORE_ORIGIN.equals(origin) && customKeyStoreId != null && xksKeyId != null) {
+            synchronized (xksKeyAssociationLocks.lockFor(customKeyStoreId + "::" + xksKeyId)) {
+                return createKeyInternal(description, keyUsage, keySpec, policy, tags, origin, multiRegion,
+                        customKeyStoreId, xksKeyId, region);
+            }
+        }
+        return createKeyInternal(description, keyUsage, keySpec, policy, tags, origin, multiRegion,
+                customKeyStoreId, xksKeyId, region);
+    }
+
+    private KmsKey createKeyInternal(String description, String keyUsage, String keySpec, String policy,
+                                     Map<String, String> tags, String origin, boolean multiRegion,
+                                     String customKeyStoreId, String xksKeyId, String region) {
         String keyId = resolveKeyId(tags, multiRegion);
         if (keyStore.get(region + "::" + keyId).isPresent()) {
             throw new AwsException("AlreadyExistsException", "Key already exists", 400);
@@ -173,6 +211,36 @@ public class KmsService implements ResourceProvider {
         key.setPolicy(policy != null ? policy : buildDefaultKeyPolicy());
         key.getTags().putAll(ReservedTags.stripReservedTags(tags));
         key.setOrigin(resolveOrigin(origin, effectiveSpec));
+        if (EXTERNAL_KEY_STORE_ORIGIN.equals(key.getOrigin())) {
+            if (multiRegion || customKeyStoreId == null || customKeyStoreId.isBlank()
+                    || xksKeyId == null || xksKeyId.isBlank() || xksDataPlaneService == null) {
+                throw new AwsException("ValidationException",
+                        "EXTERNAL_KEY_STORE requires CustomKeyStoreId and XksKeyId and does not support multi-Region keys", 400);
+            }
+            if (keyId.length() > 128) {
+                throw new AwsException("ValidationException",
+                        "KMS key IDs used with EXTERNAL_KEY_STORE must not exceed 128 characters", 400);
+            }
+            if (key.getKeySpec() != KmsKeySpec.SYMMETRIC_DEFAULT
+                    || key.getKeyUsage() != KmsKeyUsage.ENCRYPT_DECRYPT) {
+                throw new AwsException("UnsupportedOperationException",
+                        "EXTERNAL_KEY_STORE supports only SYMMETRIC_DEFAULT with ENCRYPT_DECRYPT", 400);
+            }
+            boolean alreadyAssociated = keyStore.scan(ignored -> true).stream().anyMatch(existing ->
+                    customKeyStoreId.equals(existing.getCustomKeyStoreId())
+                            && xksKeyId.equals(existing.getXksKeyId()) && existing.getArn() != null
+                            && existing.getArn().contains(":" + region + ":"));
+            if (alreadyAssociated) {
+                throw new AwsException("XksKeyAlreadyInUseException",
+                        "The XksKeyId is already associated with a KMS key in this external key store", 400);
+            }
+            xksDataPlaneService.validateKeyAssociation(customKeyStoreId, xksKeyId, region);
+            key.setCustomKeyStoreId(customKeyStoreId);
+            key.setXksKeyId(xksKeyId);
+        } else if (customKeyStoreId != null || xksKeyId != null) {
+            throw new AwsException("ValidationException",
+                    "CustomKeyStoreId and XksKeyId are valid only with Origin EXTERNAL_KEY_STORE", 400);
+        }
         key.setMultiRegion(multiRegion);
         if (multiRegion) {
             key.setMultiRegionKeyType(MULTI_REGION_PRIMARY);
@@ -183,6 +251,7 @@ public class KmsService implements ResourceProvider {
             key.setKeyState(PENDING_IMPORT);
             key.setEnabled(false);
         } else {
+            // XKS uses two layers: a KMS-generated backing key first, then the external XKS key.
             generateKeyMaterial(key, region);
         }
 
@@ -190,6 +259,12 @@ public class KmsService implements ResourceProvider {
         LOG.infov("Created KMS key: {0} ({1}/{2}, origin {3}) in {4}",
                 keyId, key.getKeyUsage(), key.getKeySpec(), key.getOrigin(), region);
         return key;
+    }
+
+    public boolean hasKeysInCustomKeyStore(String customKeyStoreId, String region) {
+        return keyStore.scan(ignored -> true).stream().anyMatch(key ->
+                customKeyStoreId.equals(key.getCustomKeyStoreId()) && key.getArn() != null
+                        && key.getArn().contains(":" + region + ":"));
     }
 
     private String resolveKeyId(Map<String, String> tags, boolean multiRegion) {
@@ -976,9 +1051,9 @@ public class KmsService implements ResourceProvider {
                         "On-demand rotation is only supported for the multi-Region primary key.", 400);
             }
             validateRotationKeySpec(key);
-            if (EXTERNAL_ORIGIN.equals(key.getOrigin())) {
+            if (EXTERNAL_ORIGIN.equals(key.getOrigin()) || EXTERNAL_KEY_STORE_ORIGIN.equals(key.getOrigin())) {
                 throw new AwsException("KMSInvalidStateException",
-                        "No available key material pending rotation for the key: " + key.getArn() + ".", 400);
+                        "Key material rotation is managed outside KMS for the key: " + key.getArn() + ".", 400);
             }
             if (key.getOnDemandRotationCount() >= ON_DEMAND_ROTATION_LIMIT) {
                 throw new AwsException("LimitExceededException",
@@ -1018,7 +1093,7 @@ public class KmsService implements ResourceProvider {
     }
 
     private static void validateRotationOrigin(KmsKey key) {
-        if (EXTERNAL_ORIGIN.equals(key.getOrigin())) {
+        if (EXTERNAL_ORIGIN.equals(key.getOrigin()) || EXTERNAL_KEY_STORE_ORIGIN.equals(key.getOrigin())) {
             throw invalidOrigin(key);
         }
     }
@@ -1306,8 +1381,15 @@ public class KmsService implements ResourceProvider {
         return switch (effective) {
             case AWS_KMS_ORIGIN -> effective;
             case EXTERNAL_ORIGIN -> requireImportableSpec(spec);
-            case "AWS_CLOUDHSM", "EXTERNAL_KEY_STORE" -> throw new AwsException("UnsupportedOperationException",
-                    "Origin " + effective + " is not supported.", 400);
+            case EXTERNAL_KEY_STORE_ORIGIN -> {
+                if (spec != KmsKeySpec.SYMMETRIC_DEFAULT) {
+                    throw new AwsException("UnsupportedOperationException",
+                            "Origin EXTERNAL_KEY_STORE supports only SYMMETRIC_DEFAULT keys", 400);
+                }
+                yield EXTERNAL_KEY_STORE_ORIGIN;
+            }
+            case "AWS_CLOUDHSM" -> throw new AwsException("UnsupportedOperationException",
+                    "Origin AWS_CLOUDHSM is not supported.", 400);
             default -> throw SmithyValidationErrors.validationException(
                     "Value '" + origin + "' at 'origin' failed to satisfy "
                             + "constraint: Member must satisfy enum value set: "
@@ -1633,14 +1715,27 @@ public class KmsService implements ResourceProvider {
         return encrypt(keyId, plaintext, encryptionContext, encryptionAlgorithm, region, "Encrypt");
     }
 
-    private EncryptResult encrypt(String keyId, byte[] plaintext, Map<String, String> encryptionContext,
-                                  String encryptionAlgorithm, String region, String operation) {
+    public EncryptResult encrypt(String keyId, byte[] plaintext, Map<String, String> encryptionContext,
+                                 String encryptionAlgorithm, String region, String operation) {
         KmsKeySpec.Algorithm algorithm = resolveEncryptionAlgorithm(encryptionAlgorithm);
         validateBlobLength("plaintext", plaintext, MAX_PLAINTEXT_BYTES);
         KmsKey kmsKey = resolveKey(keyId, region);
         validateKeyUsage(kmsKey, KmsKeyUsage.ENCRYPT_DECRYPT, operation);
         validateKeyIsUsableForCryptoOperations(kmsKey);
         validateAlgorithmForSpec(algorithm, kmsKey.getKeySpec());
+
+        if (EXTERNAL_KEY_STORE_ORIGIN.equals(kmsKey.getOrigin())) {
+            if (algorithm != KmsKeySpec.Algorithm.SYMMETRIC_DEFAULT || xksDataPlaneService == null) {
+                throw new AwsException("UnsupportedOperationException", "The requested XKS operation is not supported", 400);
+            }
+            byte[] innerEnvelope = encryptEnvelope(kmsKey, plaintext, encryptionContext);
+            try {
+                return new EncryptResult(xksDataPlaneService.encrypt(kmsKey, innerEnvelope, encryptionContext, operation),
+                        kmsKey.getArn(), algorithm.getAlgName());
+            } finally {
+                Arrays.fill(innerEnvelope, (byte) 0);
+            }
+        }
 
         if (algorithm != KmsKeySpec.Algorithm.SYMMETRIC_DEFAULT) {
             rejectEncryptionContextForAsymmetricKey(encryptionContext);
@@ -1657,6 +1752,24 @@ public class KmsService implements ResourceProvider {
     }
 
     public byte[] decrypt(byte[] ciphertext, Map<String, String> encryptionContext, String region) {
+        if (XksDataPlaneService.isXksCiphertextBlob(ciphertext)) {
+            KmsKey key = resolveKey(XksDataPlaneService.keyIdFromBlob(ciphertext), region);
+            validateKeyUsage(key, KmsKeyUsage.ENCRYPT_DECRYPT, "Decrypt");
+            validateKeyIsUsableForCryptoOperations(key);
+            if (!EXTERNAL_KEY_STORE_ORIGIN.equals(key.getOrigin()) || xksDataPlaneService == null) {
+                throw new AwsException("InvalidCiphertextException", null, 400);
+            }
+            byte[] innerEnvelope = xksDataPlaneService.decrypt(key, ciphertext, encryptionContext, "Decrypt");
+            if (!isEnvelopeV3(innerEnvelope)) {
+                Arrays.fill(innerEnvelope, (byte) 0);
+                throw new AwsException("InvalidCiphertextException", null, 400);
+            }
+            try {
+                return decryptEnvelopeV3(parseEnvelopeV3(innerEnvelope), key, encryptionContext);
+            } finally {
+                Arrays.fill(innerEnvelope, (byte) 0);
+            }
+        }
         if (isEnvelopeV3(ciphertext)) {
             EnvelopeV3 envelope = parseEnvelopeV3(ciphertext);
             KmsKey key = resolveEnvelopeKey(envelope.keyId(), region);
@@ -1671,7 +1784,9 @@ public class KmsService implements ResourceProvider {
 
     public String decryptToKeyArn(byte[] ciphertext, String region) {
         try {
-            String keyId = isEnvelopeV3(ciphertext) ? parseEnvelopeV3(ciphertext).keyId() : parseBlob(ciphertext).keyId;
+            String keyId = XksDataPlaneService.isXksCiphertextBlob(ciphertext)
+                    ? XksDataPlaneService.keyIdFromBlob(ciphertext)
+                    : isEnvelopeV3(ciphertext) ? parseEnvelopeV3(ciphertext).keyId() : parseBlob(ciphertext).keyId;
             return resolveKey(keyId, region).getArn();
         } catch (AwsException e) {
             return null;
@@ -1698,6 +1813,17 @@ public class KmsService implements ResourceProvider {
             String requestKeyId,
             String encryptionAlgorithm
     ) {
+        return decryptAndResolveKey(ciphertext, encryptionContext, region, requestKeyId, encryptionAlgorithm, "Decrypt");
+    }
+
+    public DecryptResult decryptAndResolveKey(
+            byte[] ciphertext,
+            Map<String, String> encryptionContext,
+            String region,
+            String requestKeyId,
+            String encryptionAlgorithm,
+            String operation
+    ) {
         KmsKeySpec.Algorithm algorithm = resolveEncryptionAlgorithm(encryptionAlgorithm);
         if (algorithm != KmsKeySpec.Algorithm.SYMMETRIC_DEFAULT) {
             // Raw asymmetric ciphertext carries no key metadata, so real KMS requires KeyId.
@@ -1711,6 +1837,35 @@ public class KmsService implements ResourceProvider {
             rejectEncryptionContextForAsymmetricKey(encryptionContext);
             byte[] plaintext = keyTypes.of(requestKey.getKeySpec()).decrypt(requestKey, algorithm, ciphertext);
             return new DecryptResult(plaintext, requestKey.getArn(), algorithm.getAlgName());
+        }
+
+        if (XksDataPlaneService.isXksCiphertextBlob(ciphertext)) {
+            String blobKeyId = XksDataPlaneService.keyIdFromBlob(ciphertext);
+            KmsKey key = resolveKey(blobKeyId, region);
+            if (!EXTERNAL_KEY_STORE_ORIGIN.equals(key.getOrigin()) || xksDataPlaneService == null) {
+                throw new AwsException("InvalidCiphertextException", null, 400);
+            }
+            if (requestKeyId != null && !requestKeyId.isBlank()) {
+                KmsKey requestKey = resolveKey(requestKeyId, region);
+                if (!requestKey.getKeyId().equals(key.getKeyId())) {
+                    throw new AwsException("IncorrectKeyException", "The key ID in the request does not identify a CMK that can perform this operation.", 400);
+                }
+                key = requestKey;
+            }
+            validateKeyUsage(key, KmsKeyUsage.ENCRYPT_DECRYPT, "Decrypt");
+            validateKeyIsUsableForCryptoOperations(key);
+            byte[] innerEnvelope = xksDataPlaneService.decrypt(key, ciphertext, encryptionContext, operation);
+            if (!isEnvelopeV3(innerEnvelope)) {
+                Arrays.fill(innerEnvelope, (byte) 0);
+                throw new AwsException("InvalidCiphertextException", null, 400);
+            }
+            byte[] plaintext;
+            try {
+                plaintext = decryptEnvelopeV3(parseEnvelopeV3(innerEnvelope), key, encryptionContext);
+            } finally {
+                Arrays.fill(innerEnvelope, (byte) 0);
+            }
+            return new DecryptResult(plaintext, key.getArn(), KmsKeySpec.Algorithm.SYMMETRIC_DEFAULT.getAlgName());
         }
 
         if (isEnvelopeV3(ciphertext)) {

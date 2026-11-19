@@ -7,6 +7,7 @@ import jakarta.ws.rs.container.ContainerResponseFilter;
 import jakarta.ws.rs.core.MultivaluedMap;
 import jakarta.ws.rs.ext.Provider;
 import jakarta.inject.Inject;
+import jakarta.enterprise.context.ApplicationScoped;
 
 import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
@@ -28,6 +29,7 @@ import java.util.concurrent.ThreadLocalRandom;
  * repeated in the other headers, so every SDK reads the same ID.
  */
 @Provider
+@ApplicationScoped
 public class AwsRequestIdFilter implements ContainerRequestFilter, ContainerResponseFilter {
 
     @Inject
